@@ -200,6 +200,26 @@ class FourElectrodeArraySimulator(object):
         # store the outputs
         self.output_distribution = np.concatenate( (power_distribution, interferometer_distribution) ).squeeze()
         
+        # calculate the probability amplitudes and relative phase shifts of the output state
+        #phi_0 = np.angle(self.psi_out[0])
+        #self.output_distribution = np.array( [float(abs(p)) for p in self.psi_out] + [float( (np.angle(p) - phi_0)/(4*np.pi)) for p in self.psi_out[1:]] )
+        #self.output_distribution = np.array( [float(np.real(p)) for p in self.psi_out] + [float( np.imag(p) ) for p in self.psi_out] )
+        
+        # calculate the lossy output power P_loss_i = P_out_i * epsilon_i. The ideal case is epsilon_i = 1 for all i 
+        #wg_power = self.output_distribution * np.array(self.coupling_coeff)
+        
+        # normalize the lossy output power distribution
+        #wg_power = wg_power/sum(wg_power)
+        
+        # check if we need to model the ideal behaviour without losses
+        #if ideal==0:
+            
+            # return the lossy output power distribution
+            #return wg_power
+        
+        #else:
+            
+            # return the exact output power distribution
         return self.output_distribution
     
   

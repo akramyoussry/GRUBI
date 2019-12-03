@@ -264,7 +264,7 @@ class complexMLmodel():
         self.num_wg            = num_wg
         self.num_electrodes    = 2 * num_wg
         self.length            = length
-        
+        self.mode              = 0
         # a new tensorflow input layer
         input_voltages = layers.Input(shape=(None,self.num_electrodes), name="input_voltages")
         
@@ -435,19 +435,26 @@ class complexMLmodel():
         vmax = 10.0
         return backend.tanh(x)*vmax*0.5
     
-    def construct_controller(self):
+    def construct_controller(self, mode=2):
         """
         This method is to construct the machine learning based-model for the controller. The functionality of the controller is to obtain the control voltages needed to acheive some unitary gate, undoing any distortions introduced by the parasitics of the chip. 
+        mode: whether input is real Hamiltonian-->0 , complex Hamiltonian-->1, or complex unitary-->2, default 0
         """        
         
         # define input layer for the target unitary
-        input_unitary = layers.Input( shape=(None,self.num_wg*(self.num_wg+1)//2) )
+        self.mode = mode
+        if mode==0:
+            input_matrix = layers.Input( shape=(None,self.num_wg*(self.num_wg+1)//2) )
+        elif mode==1:
+            input_matrix = layers.Input( shape=(None,self.num_wg*(self.num_wg+1)) )
+        else:
+            input_matrix = layers.Input( shape=(None,self.num_wg*self.num_wg*2) )
 
         # add a dummy layer that just generates zeros to model the electrodes that are grounded
-        zero_output      = layers.Lambda(lambda x: x[:,:,0:1]*0, output_shape=(None,None,1))(input_unitary)     
+        zero_output      = layers.Lambda(lambda x: x[:,:,0:1]*0, output_shape=(None,None,1))(input_matrix)     
                         
         # add an GRU of 60 hidden nodes that is connected to the corresponding input layer of this electrode
-        control_voltages = layers.GRU(60, return_sequences=True)(input_unitary)
+        control_voltages = layers.GRU(60, return_sequences=True)(input_matrix)
         
         # add a neuron layer with the scaled tanh activation that acts over each time slice
         control_voltages = tf.layers.Dense(self.num_electrodes-2,activation=self.scaled_tanh)(control_voltages)
@@ -463,7 +470,7 @@ class complexMLmodel():
             layer.trainable  = False
         
         # define the controller model by connecting the new GRU with the pretrained GRU
-        controller_train_model = Model(inputs = input_unitary, outputs = Hamiltonian_model(control_voltages) )
+        controller_train_model = Model(inputs = input_matrix, outputs = Hamiltonian_model(control_voltages) )
                 
         # specify the optimizer and loss function for training
         controller_train_model.compile(optimizer=optimizers.RMSprop(), loss='mse', metrics=['mse'])
@@ -474,41 +481,49 @@ class complexMLmodel():
         # store the full control part [inverse model+model] as a class member 
         self.controller_train_model = controller_train_model
         
-    def flatten_Hamiltonian(self, H):
+    def flatten_input(self, H):
         """
-        This is an internal method for extracting the upper triangular part from the Hamiltonian, which makes it more efficient in the training process, since the Hamilonian must be Hermitian.
+        This is an internal method for reshaping input matrices to the GRU layer of the controller.
         
-        H: a numpy array representing a Hamiltonian with shape (number of examples,number of time steps, number of waveguides, number of waveguides)
+        H: a numpy array representing the target matrx input (target unitary) with shape (number of examples,number of time steps, number of waveguides, number of waveguides)
         """        
         # retreive the batch size from the training dataset
         num_examples = H.shape[0]
         num_points   = H.shape[1]
         
         # initialize the array for expanding the upper triangular part
-        params = np.zeros( (num_examples,num_points,self.num_wg*(self.num_wg+1)//2) )
+        params_r = np.zeros( (num_examples,num_points,self.num_wg*(self.num_wg+1)//2) )
+        params_i = np.zeros( (num_examples,num_points,self.num_wg*(self.num_wg+1)//2) )
         
         # define an anynomus function to extract upper triangular part of a matrix
         get_upper = (lambda x: x[np.mask_indices(self.num_wg, np.triu)])
         
-        #extract upper triangular part of the Hamiltonian
-        for idx_ex in range(num_examples):
-            for idx_t in range(num_points):
-                params[idx_ex,idx_t,:] = get_upper(H[idx_ex,idx_t,:])
-        return params
-   
+        if self.mode==0 or self.mode==1:
+            #extract upper triangular part of the Hamiltonian
+            for idx_ex in range(num_examples):
+                for idx_t in range(num_points):
+                    params_r[idx_ex,idx_t,:] = np.real(get_upper(H[idx_ex,idx_t,:]))
+                    params_i[idx_ex,idx_t,:] = np.imag(get_upper(H[idx_ex,idx_t,:]))
+        if self.mode==0:
+            return params_r
+        elif self.mode==1:
+            return np.concatenate((params_r, params_i),axis=-1)
+        else:
+            return np.concatenate((np.real(np.reshape(H,(num_examples, num_points, self.num_wg*self.num_wg))), np.imag(np.reshape(H,(num_examples, num_points, self.num_wg*self.num_wg))) ),axis=-1)
+
     def train_controller(self, target_H, target_y, epochs):
         """
-        This is the method to train the controller to find the set of control voltages to obtain the target power distribution using target Hamiltonian
+        This is the method to train the controller to find the set of control voltages to obtain the target power distribution
         
-        target_H: a numpy representing the sequence of target Hamiltonians of shape (number of examples,number of time steps, number of waveguides, number of waveguides) 
+        target_H: a numpy representing the sequence of targets of shape (number of examples,number of time steps, number of waveguides, number of waveguides) 
         target_y: A list of numpy arrays of length equal to the number of bases used in the model (in the current implementation it is equal to number of waveguides). Each item in the list is a numpy array stroing the ideal output power distribution (i.e.without coupling losses with shape) of shape (number of examples,number of time steps, number of electrodes).
 
         """
         # retreive the batch size from the training dataset
         num_examples = target_H.shape[0]
         
-        #flatten out the Hamiltonian
-        params = self.flatten_Hamiltonian(target_H)
+        #flatten out the input
+        params = self.flatten_input(target_H)
         
         # Train the model for "epochs" number of iterations using the provided training set, and store the training history
         self.control_training_history = self.controller_train_model.fit(params, target_y, epochs=epochs, batch_size=num_examples,verbose=2).history 
@@ -519,8 +534,8 @@ class complexMLmodel():
         
         target_H: a numpy representing the sequence of target Hamiltonians of shape (number of examples,number of time steps, number of waveguides, number of waveguides) 
         """
-        #flatten out the Hamiltonian
-        params = self.flatten_Hamiltonian(target_H)
+        #flatten out the input
+        params = self.flatten_input(target_H)
         
         # Define a model to capture the control part only [inverse model witout model -qunatum] 
         controller_model = Model(inputs = self.controller_train_model.input, outputs = self.controller_train_model.layers[-2].output )
@@ -559,6 +574,7 @@ class complexMLmodel():
                 'num_wg':self.num_wg,
                 'num_electrodes':self.num_electrodes,
                 'length':self.length,
+                'mode':self.mode
                 }
         f = open(filename+"_class.h5", 'wb')
         pickle.dump(data, f, -1)
@@ -587,21 +603,24 @@ class complexMLmodel():
         f.extractall()
         f.close()
         
-        # first load the ml model
-        self.model.load_weights(filename+"_model.h5")
-        # second, construct the controller and load its weights
-        self.construct_controller()
-        self.controller_train_model.load_weights(filename+"_controller.h5")
-                
-        # third, load all other variables
+        # first load the class variables
         f = open(filename+"_class.h5", 'rb')
         data = pickle.load(f)
         f.close()          
+        
         self.training_history          = data['training_history']
         self.control_training_history  = data['control_training_history']
         self.num_wg                    = data['num_wg']
         self.num_electrodes            = data['num_electrodes']  
         self.length                    = data['length']
+        self.mode                      = data['mode']
+        
+        # second, load ml model
+        self.model.load_weights(filename+"_model.h5")       
+
+        # sthird, construct the controller and load its weights
+        self.construct_controller(self.mode)
+        self.controller_train_model.load_weights(filename+"_controller.h5")
         
         # now delete all the tmp files
         os.remove(filename+"_model.h5")
